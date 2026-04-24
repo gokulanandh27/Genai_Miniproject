@@ -36,9 +36,16 @@ playwright install chromium
 ### 5. Configure Environment Variables
 Since the `.env` file is ignored by Git for security, you must recreate it:
 1. Create a file named `.env` in the root directory.
-2. Add your Gemini API key:
+2. Add your preferred AI provider keys:
    ```env
-   GOOGLE_API_KEY=your_actual_api_key_here
+   # Google (Gemini) - Primary
+   GOOGLE_API_KEY=your_gemini_key
+
+   # Groq (Llama 3, Mixtral) - Fast extraction
+   GROQ_API_KEY=your_groq_key
+
+   # SiliconFlow (DeepSeek, Qwen) - Alternative
+   SILICONFLOW_API_KEY=your_siliconflow_key
    ```
 
 ### 6. Run the Application
