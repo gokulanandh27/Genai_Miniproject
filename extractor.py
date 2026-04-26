@@ -1,225 +1,163 @@
 """
-extractor.py — LLM Extraction Pipeline (Gemini + OpenAI)
-Supports Gemini (recommended) and OpenAI fallback.
+extractor.py — LLM-powered structured data extractor
+Uses Gemini → Groq → SiliconFlow fallback chain for resilience.
 """
-
-import asyncio
+import os
 import json
 import logging
 import re
-from typing import Any
-import os
+import asyncio
 
-import google.generativeai as genai
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, SystemMessage
-
-from html_cleaner import HTMLCleaner
+from langchain_core.messages import SystemMessage, HumanMessage
 
 logger = logging.getLogger(__name__)
 
+EXTRACT_SYSTEM = """You are a master data extraction engine.
 
-SYSTEM_PROMPT = """You are a precise data extraction engine. Your ONLY job is to extract data that is EXPLICITLY present in the provided text.
+IDENTIFY INTENT:
+1. SINGULAR FACTS: If the user asks for a specific fact (e.g., "CEO name", "Headquarters"), extract ONLY that single best answer.
+2. REPEATING DATA: If the user asks for a list (e.g., "laptops", "job openings"), extract every matching row.
 
-ABSOLUTE RULES — violations will cause system failure:
-1. NEVER invent, infer, or hallucinate any values
-2. If a field value is not clearly present in the text → use null
-3. Extract ONLY complete, well-formed items — no partial guesses
-4. Return ONLY a valid JSON array of objects, no markdown, no explanation, no preamble
-5. If NO items match → return exactly: []
-
-Structure the JSON keys dynamically based on what the user is asking for. Use descriptive keys for each object.
+Rules:
+- Return ONLY a JSON list of objects: [{"field1": "val", ...}]
+- For REPEATING data, extract AS MANY items as possible up to the limit.
+- For SINGULAR facts, return a list with exactly ONE object containing the fact.
+- Clean all values: remove HTML, extra whitespace, and noisy labels.
+- Do not add explanations. Return pure JSON starting with `[` and ending with `]`.
 """
+
+# Ordered fallback models
+FALLBACK_MODELS = [
+    ("groq", "llama-3.3-70b-versatile"),
+    ("groq", "llama-3.1-8b-instant"),
+    ("gemini", "gemini-2.5-flash-lite"),
+    ("gemini", "gemini-2.0-flash"),
+    ("gemini", "gemini-1.5-flash"),
+]
 
 
 class LLMExtractor:
-    def __init__(self, llm_provider: str = "gemini", model: str = None):
-        self.cleaner = HTMLCleaner()
-        self.provider = llm_provider
-        # We don't build a single LLM anymore; we build it per-call in the fallback chain
-        self.primary_model = model
+    def __init__(self):
+        self.google_key = os.getenv("GOOGLE_API_KEY")
+        self.groq_key = os.getenv("GROQ_API_KEY")
+        self.sf_key = os.getenv("SILICONFLOW_API_KEY")
 
-    # Ordered fallback list — tries each in order when quota is exhausted
-    # Format: "provider:model_name"
-    FALLBACK_MODELS = [
-        "gemini:gemini-flash-lite-latest",
-        "groq:llama-3.1-70b-versatile",
-        "siliconflow:deepseek-ai/DeepSeek-V3",
-        "gemini:gemini-2.0-flash-lite",
-        "groq:mixtral-8x7b-32768",
-    ]
+    def _build_prompt(self, page_text: str, prompt: str, fields: dict, limit: int, filter_desc: str) -> str:
+        fields_str = "\n".join(f"- {k}: {v}" for k, v in fields.items())
+        filter_note = f"\nFilter: {filter_desc}" if filter_desc else ""
+        return (
+            f"User Request: {prompt}\n"
+            f"EXTRACT AS MANY ITEMS AS POSSIBLE, up to a maximum of {limit} items.\n"
+            f"Return the data with these fields:\n{fields_str}"
+            f"{filter_note}\n\n"
+            f"Page Content:\n{page_text}\n\n"
+            f"Return ONLY a JSON array."
+        )
 
-    async def extract(self, pages_data: list[dict], fields: list[str], url: str) -> list[dict]:
-        """
-        Concatenates ALL scraped pages into one text block and makes a SINGLE
-        LLM API call. This is far more quota-efficient than one call per page.
-        """
-        if not pages_data:
+    async def extract(self, page_text: str, prompt: str, fields: dict, limit: int = 10, filter_desc: str = "") -> list:
+        if not page_text.strip():
             return []
 
-        # Build one big combined text from all pages
-        all_text_parts = []
-        for page in pages_data:
-            cleaned = self.cleaner.clean(page["html"])
-            all_text_parts.append(f"=== PAGE {page['page_num']} ({page['url']}) ===\n{cleaned}")
-
-        combined_text = "\n\n".join(all_text_parts)
-        logger.info(f"Combined text length: {len(combined_text)} chars across {len(pages_data)} pages. Making 1 LLM call.")
-
-        # If combined text exceeds token budget, chunk it into segments
-        MAX_CHARS = 800_000
-        if len(combined_text) > MAX_CHARS:
-            logger.warning(f"Text too long ({len(combined_text)} chars), chunking into segments...")
-            segments = self.cleaner.chunk(combined_text, max_chars=MAX_CHARS)
-        else:
-            segments = [combined_text]
-
-        all_items: list[dict] = []
-        seen_keys: set[str] = set()
-
-        for seg_idx, segment in enumerate(segments):
-            logger.info(f"Extracting segment {seg_idx+1}/{len(segments)}...")
-            items = await self._extract_chunk_with_retry(segment, fields, url)
-            for item in items:
-                valid_values = [v for v in item.values() if isinstance(v, str) and v.strip()]
-                key = valid_values[0].lower().strip() if valid_values else str(item)
-                if key and key not in seen_keys:
-                    seen_keys.add(key)
-                    all_items.append(item)
-
-        logger.info(f"Total extracted: {len(all_items)} items")
-        return all_items
-
-    async def _extract_chunk_with_retry(self, text: str, fields: list[str], url: str) -> list[dict]:
-        """Calls LLM with automatic model fallback on 429 quota errors."""
-        extra_fields_note = f"\nUser is looking for: {', '.join(fields)}" if fields else ""
-        user_message = f"""Extract all matching items from the text below.
-{extra_fields_note}
-
-Source URL: {url}
-
-TEXT:
-{text}
-
-Return ONLY a valid JSON array. If nothing matches, return [].
-"""
-        
-        # Decide the models to try
-        models_to_try = self.FALLBACK_MODELS.copy()
-        if self.primary_model:
-            # If a specific model was requested, put it first
-            p_model = f"{self.provider}:{self.primary_model}" if ":" not in self.primary_model else self.primary_model
-            if p_model in models_to_try: models_to_try.remove(p_model)
-            models_to_try.insert(0, p_model)
-
-        for model_str in models_to_try:
+        # ── 1. Try Groq (Fastest/Reliable) ────────────
+        groq_text = page_text[:40000] # Safe limit for Llama-3 70b
+        messages = [
+            SystemMessage(content=EXTRACT_SYSTEM),
+            HumanMessage(content=self._build_prompt(groq_text, prompt, fields, limit, filter_desc))
+        ]
+        for model in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
             try:
-                provider, model_name = model_str.split(":", 1)
-                logger.info(f"🔄 LLM SWITCH: Trying {provider.upper()} model: {model_name}")
-                
-                raw_text = await self._call_provider(provider, model_name, user_message)
-                if raw_text:
-                    clean_raw = raw_text[:200].replace("\n", " ")
-                    logger.info(f"✅ SUCCESS: {provider.upper()} extraction complete. Raw snippet: {clean_raw}")
-                    return self._parse_response(raw_text)
-                else:
-                    logger.warning(f"⚠️ SKIPPED: {provider} returned no content (missing key).")
-                    continue
-
-            except Exception as e:
-                err_str = str(e).lower()
-                logger.warning(f"❌ FAILED: {model_str} error: {e}")
-                if any(x in err_str for x in ["429", "rate_limit", "quota", "overloaded", "not found", "authentication"]):
-                    logger.warning(f"⏭️ FALLBACK: Quota/Auth issue on {model_str}, switching to next...")
-                    continue
-                else:
-                    logger.warning(f"⏭️ FALLBACK: Unexpected error, trying next...")
-                    continue
-
-        logger.error("All models and providers exhausted their quotas or failed. Cannot extract.")
-        return []
-
-    async def _call_provider(self, provider: str, model_name: str, user_message: str) -> str:
-        """Call the specific LLM provider API."""
-        try:
-            if provider == "gemini":
-                api_key = os.getenv("GOOGLE_API_KEY")
-                if not api_key or api_key == "your_api_key_here" or api_key.strip() == "":
-                    return None
-                genai.configure(api_key=api_key)
-                llm = genai.GenerativeModel(model_name)
-                response = await asyncio.to_thread(llm.generate_content, SYSTEM_PROMPT + "\n\n" + user_message)
-                return response.text
-
-            elif provider == "groq":
-                api_key = os.getenv("GROQ_API_KEY")
-                if not api_key or api_key.strip() == "":
-                    return None
+                if not self.groq_key: break
                 llm = ChatOpenAI(
-                    model=model_name,
-                    openai_api_key=api_key,
+                    model=model,
+                    openai_api_key=self.groq_key,
                     openai_api_base="https://api.groq.com/openai/v1",
                     temperature=0,
+                    max_tokens=4096,
                 )
-                response = await llm.ainvoke([
-                    SystemMessage(content=SYSTEM_PROMPT),
-                    HumanMessage(content=user_message),
-                ])
-                return response.content
+                resp = await llm.ainvoke(messages)
+                parsed = self._parse(resp.content)
+                if parsed is not None:
+                    logger.info(f"Extracted {len(parsed)} items via groq/{model}")
+                    return parsed[:limit]
+            except Exception as e:
+                logger.warning(f"Extractor fallback groq/{model} failed: {e}")
 
-            elif provider == "siliconflow":
-                api_key = os.getenv("SILICONFLOW_API_KEY")
-                if not api_key or api_key.strip() == "":
-                    return None
+        # ── 2. Try Gemini (High Context) ──────────────
+        gemini_text = page_text[:150000]
+        messages = [
+            SystemMessage(content=EXTRACT_SYSTEM),
+            HumanMessage(content=self._build_prompt(gemini_text, prompt, fields, limit, filter_desc))
+        ]
+        for model in ["gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-1.5-flash"]:
+            try:
+                if not self.google_key: break
+                llm = ChatGoogleGenerativeAI(
+                    model=model, 
+                    google_api_key=self.google_key, 
+                    temperature=0,
+                    max_retries=0
+                )
+                resp = await llm.ainvoke(messages)
+                parsed = self._parse(resp.content)
+                if parsed is not None:
+                    logger.info(f"Extracted {len(parsed)} items via {model}")
+                    return parsed[:limit]
+            except Exception as e:
+                logger.warning(f"Extractor fallback {model} failed: {e}")
+
+        # ── 3. Try SiliconFlow ──────────────────────────
+        for model in ["deepseek-ai/DeepSeek-V3"]:
+            try:
+                if not self.sf_key: break
                 llm = ChatOpenAI(
-                    model=model_name,
-                    openai_api_key=api_key,
+                    model=model,
+                    openai_api_key=self.sf_key,
                     openai_api_base="https://api.siliconflow.cn/v1",
                     temperature=0,
+                    max_tokens=4096,
                 )
-                response = await llm.ainvoke([
-                    SystemMessage(content=SYSTEM_PROMPT),
-                    HumanMessage(content=user_message),
-                ])
-                return response.content
-            
-            # Fallback to OpenAI if key exists
-            elif provider == "openai":
-                api_key = os.getenv("OPENAI_API_KEY")
-                if not api_key: return None
-                llm = ChatOpenAI(model=model_name, openai_api_key=api_key, temperature=0)
-                response = await llm.ainvoke([
-                    SystemMessage(content=SYSTEM_PROMPT),
-                    HumanMessage(content=user_message),
-                ])
-                return response.content
+                resp = await llm.ainvoke(messages)
+                parsed = self._parse(resp.content)
+                if parsed is not None:
+                    logger.info(f"Extracted {len(parsed)} items via siliconflow/{model}")
+                    return parsed[:limit]
+            except Exception as e:
+                logger.warning(f"Extractor fallback siliconflow/{model} failed: {e}")
 
-        except Exception as e:
-            logger.error(f"Provider {provider} call failed: {e}")
-            raise # Re-raise to be caught by the fallback loop
-        
-        return None
+        logger.error("All LLM providers exhausted")
+        return []
 
-    def _parse_response(self, raw: str) -> list[dict]:
+    def _parse(self, raw: str) -> list:
+        if not raw:
+            return None
         raw = raw.strip()
-        # Remove markdown if present
-        raw = re.sub(r"^```(?:json)?", "", raw, flags=re.IGNORECASE)
-        raw = re.sub(r"```$", "", raw, flags=re.IGNORECASE)
+        # Remove markdown fences
+        raw = re.sub(r"^```(?:json)?\n?", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\n?```$", "", raw, flags=re.IGNORECASE)
+        
+        # Helper to find array inside dict
+        def extract_array(data):
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                for val in data.values():
+                    if isinstance(val, list):
+                        return val
+            return []
 
         try:
             data = json.loads(raw)
-            if isinstance(data, list):
-                return data
-            return []
+            return extract_array(data)
         except Exception:
-            # Try to find JSON array in the text
-            match = re.search(r"\[\s*\{.*\}\s*\]", raw, re.DOTALL)
+            # Fallback regex to find array
+            match = re.search(r"\[[\s\S]*\]", raw)
             if match:
                 try:
-                    return json.loads(match.group())
-                except: pass
-            logger.warning(f"Failed parsing JSON from raw text.")
-            return []
-
-    async def _extract_chunk(self, text: str, fields: list[str], url: str) -> list[dict]:
-        return await self._extract_chunk_with_retry(text, fields, url)
+                    data = json.loads(match.group())
+                    return extract_array(data)
+                except Exception:
+                    pass
+        logger.warning(f"Failed to parse JSON from LLM response. Snippet: {raw[:100]}")
+        return []

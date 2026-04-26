@@ -1,0 +1,1 @@
+@tailwind base;@tailwind components;@tailwind utilities;:root{--lightningcss-light: ;--lightningcss-dark:initial;color-scheme:dark}@apply bg-background text-gray-200 font-sans antialiased;@apply bg-white/5 backdrop-blur-xl border border-white/10 shadow-2xl;@apply shadow-[0_0_20px_rgba(99,102,241,.3)];

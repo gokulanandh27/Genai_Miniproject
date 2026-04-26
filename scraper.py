@@ -1,452 +1,319 @@
 """
-scraper.py — Enterprise Playwright Scraping Engine
-Optimized hybrid approach: DOM-first logic, LLM as fallback.
+scraper.py - Universal Intelligent Stealth Scraper
+- Singleton browser instance (no crash on reuse)
+- Smart content-aware waiting per site type
+- Profile rotation (Desktop / Mobile)
+- Automatic fallback URL patterns
 """
-
 import asyncio
-import random
 import logging
-from typing import Optional
-from playwright.async_api import async_playwright, Page, Browser, BrowserContext
-from playwright_stealth import stealth_async
+import random
+import re
+from urllib.parse import urljoin, urlparse, quote_plus
+
+from playwright.async_api import async_playwright
+from playwright_stealth import Stealth
+from selectolax.parser import HTMLParser
+import html2text
 
 logger = logging.getLogger(__name__)
 
-# ─── Realistic browser fingerprints ───────────────────────────────────────────
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+PROFILES = [
+    {
+        "name": "Windows Chrome",
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "viewport": {"width": 1280, "height": 800},
+        "is_mobile": False,
+    },
+    {
+        "name": "Mac Chrome",
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "viewport": {"width": 1440, "height": 900},
+        "is_mobile": False,
+    },
+    {
+        "name": "iPhone 14",
+        "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+        "viewport": {"width": 390, "height": 844},
+        "is_mobile": True,
+    },
 ]
 
-VIEWPORTS = [
-    {"width": 1920, "height": 1080},
-    {"width": 1440, "height": 900},
-    {"width": 1366, "height": 768},
+# Product selectors by site domain — used for smart waiting
+SITE_SELECTORS = {
+    "amazon": [
+        'div[data-component-type="s-search-result"]',
+        '.s-main-slot .s-result-item',
+        '#search .s-result-item',
+    ],
+    "flipkart": [
+        'div[data-id]',
+        '._1AtVbE',
+        '.CXW8mj',
+        'div._2kHMtA',
+    ],
+    "shopclues": [
+        'div.column',
+        'div.products',
+        'ul.prd-grid-list',
+        'div.prd_box',
+    ],
+    "ebay": ['li.s-item', '.srp-results .s-item'],
+    "default": ['article', 'div.product', 'div.card', '.product-item', 'li.product'],
+}
+
+BLOCK_SIGNALS = [
+    "captcha", "security challenge", "robot check",
+    "verify you are human", "are you a robot",
+    "unusual traffic", "access denied",
 ]
 
 
-class PlaywrightScraper:
-    """
-    Core scraping engine. Handles:
-      - Stealth browser launch
-      - Human-like navigation (delays, scrolls)
-      - Cookie/consent banner dismissal
-      - Search-first flow for e-commerce sites
-      - Structured HTML extraction per page
-      - Delegation to PaginationHandler for multi-page traversal
-    """
+class IntelligentScraper:
+    """Singleton-safe universal scraper."""
 
-    def __init__(self, config: dict = None):
-        self.config = config or {}
-        self.max_pages: int = self.config.get("max_pages", 5)
-        self.timeout: int = self.config.get("timeout_ms", 60_000)
-        self.headless: bool = self.config.get("headless", True)
-        self.proxy: Optional[dict] = self.config.get("proxy")  # {"server": "...", "username": ..., "password": ...}
+    _pw = None
+    _browser = None
 
-    # ── Public entry point ────────────────────────────────────────────────────
+    async def _ensure_browser(self):
+        """Start playwright and chromium if not already running."""
+        try:
+            # Check if existing browser is still alive
+            if IntelligentScraper._browser:
+                # Ping by creating a dummy context check
+                _ = IntelligentScraper._browser.is_connected()
+                if not IntelligentScraper._browser.is_connected():
+                    raise Exception("Browser disconnected")
+        except Exception:
+            logger.info("Browser was dead, restarting...")
+            IntelligentScraper._browser = None
+            IntelligentScraper._pw = None
 
-    async def scrape(self, url: str, fields: list[str], filter_description: str = "", llm_client=None) -> list[dict]:
-        """
-        Scrape `url` for `fields`. Returns list of raw item dicts.
-        Each dict is keyed by field; values are raw strings from the page.
-        """
-        import sys
-        if sys.platform.startswith("win"):
-            # Run in a separate thread with a forced ProactorEventLoop to bypass Uvicorn Windows bugs
-            return await asyncio.to_thread(self._scrape_sync_wrapper, url, fields, filter_description, llm_client)
-        else:
-            return await self._do_scrape(url, fields, filter_description, llm_client)
- 
-    def _scrape_sync_wrapper(self, url: str, fields: list[str], filter_description: str = "", llm_client=None) -> list[dict]:
-        """Thread wrapper to ensure ProactorEventLoop is used on Windows."""
-        import sys
-        if sys.platform.startswith("win"):
-            loop = asyncio.ProactorEventLoop()
-            asyncio.set_event_loop(loop)
-        else:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+        if not IntelligentScraper._pw:
+            IntelligentScraper._pw = await async_playwright().start()
+        if not IntelligentScraper._browser:
+            IntelligentScraper._browser = await IntelligentScraper._pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
+            )
+            logger.info("Browser started fresh.")
+
+    def _get_selectors(self, url: str) -> list:
+        """Return site-specific CSS selectors for smart waiting."""
+        domain = urlparse(url).netloc.lower()
+        for key, sels in SITE_SELECTORS.items():
+            if key in domain:
+                return sels
+        return SITE_SELECTORS["default"]
+
+    async def _clean_content(self, html: str) -> str:
+        """Convert HTML to clean, LLM-friendly Markdown."""
+        h = html2text.HTML2Text()
+        h.ignore_links = False
+        h.ignore_images = True
+        h.body_width = 0
+        h.ignore_emphasis = False
         
+        # Simple noise reduction
         try:
-            return loop.run_until_complete(self._do_scrape(url, fields, filter_description, llm_client))
-        finally:
-            loop.close()
- 
-    async def _do_scrape(self, url: str, fields: list[str], filter_description: str = "", llm_client=None) -> list[dict]:
-        self.llm_client = llm_client
-        async with async_playwright() as pw:
-            browser = await self._launch_browser(pw)
-            page = None
-            try:
-                context = await self._create_context(browser)
-                page = await context.new_page()
-                await stealth_async(page)
- 
-                # Step 1: Navigate
-                logger.info(f"Navigating to {url}")
-                try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout)
-                except Exception as e:
-                    logger.error(f"Initial navigation failed: {e}")
-                    if page:
-                        html = await page.content()
-                        with open("error_page.html", "w", encoding="utf-8") as f:
-                            f.write(html)
-                    raise
- 
-                content = await page.content()
-                text_snippet = await page.evaluate("document.body.innerText")
-                clean_snippet = text_snippet[:500].replace("\n", " ")
-                logger.info(f"PAGE HTML LENGTH: {len(content)}")
-                logger.info(f"PAGE TEXT SNIPPET: {clean_snippet}...")
-                
-                # Initial popup dismissal
-                await self._dismiss_consent(page)
-                await self._human_pause(1.0, 2.5)
- 
-                # Step 2: If search-needed (e.g. Amazon), trigger search for primary field
-                # Only attempt if we have a search query (empty list = browse mode, no search)
-                search_triggered = False
-                if fields:
-                    # Dismiss popups again right before searching
-                    await self._dismiss_consent(page)
-                    search_triggered = await self._try_search(page, fields[0])
-                
-                if search_triggered:
-                    try:
-                        # Wait for either a navigation or a small timeout to let AJAX results load
-                        logger.info("Waiting for search results to load...")
-                        await page.wait_for_load_state("networkidle", timeout=5000)
-                    except:
-                        pass
-                    
-                    # Heuristic: Wait for product elements to appear
-                    product_selectors = [".product", ".item", ".search_res", ".row", "[class*='product' i]", ".grid-view"]
-                    for sel in product_selectors:
-                        try:
-                            await page.wait_for_selector(sel, state="visible", timeout=3000)
-                            logger.info(f"Confirmed results loaded via selector: {sel}")
-                            break
-                        except: continue
-
-                    # Log snippet of the results page
-                    results_html = await page.content()
-                    results_text = await page.evaluate("document.body.innerText")
-                    clean_results = results_text[:1000].replace("\n", " ")
-                    logger.info(f"RESULTS PAGE HTML LENGTH: {len(results_html)}")
-                    logger.info(f"RESULTS PAGE TEXT SNIPPET: {clean_results}...")
-                    
-                    if len(results_html) < 5000:
-                        logger.warning("Results page looks suspiciously small. Search might have failed or returned no results.")
-                    
-                    await self._dismiss_consent(page)
- 
-                # Step 2.5: Apply filters if provided
-                if filter_description:
-                    logger.info(f"Attempting to apply filter: {filter_description}")
-                    filter_applied = await self._try_apply_filter(page, filter_description)
-                    if filter_applied:
-                        try:
-                            await page.wait_for_load_state("networkidle", timeout=5000)
-                            await self._dismiss_consent(page)
-                        except:
-                            pass
- 
-                # Step 2.7: Deep Crawl (Follow Detail Links if needed)
-                # If prompt mentions "description", "detail", "specs", etc.
-                html_pages = []
-                deep_keywords = ["description", "detail", "specs", "specification", "about", "review"]
-                if any(k in " ".join(fields).lower() for k in deep_keywords):
-                    logger.info("Detected detail-oriented prompt. Attempting deep crawl...")
-                    deep_pages = await self._try_deep_crawl(page, fields)
-                    if deep_pages:
-                        html_pages.extend(deep_pages)
-
-                # Step 3: Paginate + collect HTML chunks
-                await self._dismiss_consent(page)
-                from pagination import PaginationHandler
-                paginator = PaginationHandler(page, max_pages=self.max_pages)
-                remaining_pages = await paginator.collect_all_pages()
-                html_pages.extend(remaining_pages)
-                
-                return html_pages
- 
-            finally:
-                if browser:
-                    await browser.close()
- 
-    # ── Helpers ───────────────────────────────────────────────────────────────
- 
-    async def _try_deep_crawl(self, page: Page, fields: list[str]) -> list[dict]:
-        """
-        Heuristic-based deep crawling:
-        1. Find all links on the page (text + title attribute).
-        2. Identify links that match words in the prompt.
-        3. Visit them and return their HTML.
-        """
-        try:
-            # 1. Get all links with their text and title
-            links = await page.evaluate("""
-                () => {
-                    return Array.from(document.querySelectorAll('a')).map(a => ({
-                        text: a.innerText.trim(),
-                        title: a.getAttribute('title') || '',
-                        href: a.href
-                    })).filter(l => (l.text.length > 2 || l.title.length > 2) && l.href.startsWith('http'))
-                }
-            """)
+            parser = HTMLParser(html)
+            # Remove scripts, styles, nav, footer
+            for tag in ["script", "style", "nav", "footer", "header", "aside"]:
+                for el in parser.css(tag):
+                    el.decompose()
+            html = parser.html or html
+        except Exception:
+            pass
             
-            # 2. Heuristic match: find links that appear in the prompt
-            prompt_text = " ".join(fields).lower()
-            to_visit = []
-            
-            # Avoid visiting too many
-            max_deep = 5
-            
-            for link in links:
-                if len(to_visit) >= max_deep: break
-                
-                # Check visible text and title attribute
-                # Clean the text (remove dots, etc)
-                link_text = link['text'].lower().replace("...", "").strip()
-                link_title = link['title'].lower().strip()
-                
-                match = False
-                if link_text and len(link_text) > 4 and link_text in prompt_text:
-                    match = True
-                elif link_title and len(link_title) > 4 and link_title in prompt_text:
-                    match = True
-                
-                if match:
-                    if link['href'] not in to_visit:
-                        logger.info(f"Matched detail link: '{link_text}' / '{link_title}' -> {link['href']}")
-                        to_visit.append(link['href'])
-            
-            if not to_visit:
-                logger.warning("No detail links matched the prompt criteria.")
-                return []
-            
-            async def visit_link(i, url):
-                logger.info(f"Deep crawling detail page {i+1}: {url}")
-                new_page = await page.context.new_page()
-                try:
-                    await stealth_async(new_page)
-                    # Use a shorter timeout and wait only for commit
-                    await new_page.goto(url, wait_until="commit", timeout=15000)
-                    await self._dismiss_consent(new_page)
-                    
-                    # Quick scroll
-                    await new_page.evaluate("window.scrollTo(0, 500)")
-                    await asyncio.sleep(0.5)
-                    
-                    html = await new_page.content()
-                    from html_cleaner import HTMLCleaner
-                    cleaner = HTMLCleaner()
-                    cleaned = cleaner.clean(html)
-                    
-                    return {
-                        "page_num": f"detail_{i+1}",
-                        "url": url,
-                        "html": cleaned
-                    }
-                except Exception as e:
-                    logger.warning(f"Failed to crawl detail page {url}: {e}")
-                    return None
-                finally:
-                    await new_page.close()
+        return h.handle(html)
 
-            # Limit to top 3 most relevant links to save time
-            tasks = [visit_link(i, url) for i, url in enumerate(to_visit[:3])]
-            results = await asyncio.gather(*tasks)
-            deep_results = [r for r in results if r]
-            
-            return deep_results
-        except Exception as e:
-            logger.error(f"Deep crawl failed: {e}")
-            return []
-
-
-
-
-    async def _launch_browser(self, pw) -> Browser:
-        launch_opts = {
-            "headless": self.headless,
-            "args": [
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--disable-extensions",
-            ],
-        }
-        if self.proxy:
-            launch_opts["proxy"] = self.proxy
-        return await pw.chromium.launch(**launch_opts)
-
-    async def _create_context(self, browser: Browser) -> BrowserContext:
-        context = await browser.new_context(
-            user_agent=random.choice(USER_AGENTS),
-            viewport=random.choice(VIEWPORTS),
-            locale="en-US",
-            timezone_id="America/New_York",
-            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
-            ignore_https_errors=True,
-        )
-        # Block images to save bandwidth and speed up load
-        await context.route("**/*.{png,jpg,jpeg,gif,webp,svg}", lambda route: route.abort())
-        return context
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
-    async def _dismiss_consent(self, page: Page):
-        """Click common cookie/consent/popup close buttons."""
-        selectors = [
-            "button[id*='accept']", "button[class*='accept']",
-            "button[aria-label*='Accept']", "#onetrust-accept-btn-handler",
-            ".cc-accept", "[data-testid='accept-button']",
-            "button.p-close", ".p-close", "button:has-text('Close')", # Shopclues/Popups
-            ".modal-close", ".close-modal", "[aria-label='Close']",
+    async def _bypass_popups(self, page):
+        """Tries to find and click 'Accept Cookies' or 'Close' buttons."""
+        common_buttons = [
+            "Accept", "Agree", "Allow", "Consent", "Continue", "OK", "I agree", 
+            "Got it", "Close", "Accept All", "Allow All"
         ]
-        for sel in selectors:
+        for btn_text in common_buttons:
             try:
-                # Use a very short timeout for each check to avoid slowing down too much
-                btn = await page.wait_for_selector(sel, state="visible", timeout=1000)
-                if btn:
-                    await btn.click(force=True)
-                    logger.info(f"Dismissed popup/consent via {sel}")
-                    await self._human_pause(0.5, 1.0)
+                # Case-insensitive text match for buttons
+                btn = page.get_by_role("button", name=re.compile(f"^{btn_text}$", re.I))
+                if await btn.is_visible():
+                    await btn.click(timeout=2000)
+                    logger.info(f"Bypassed popup using button: {btn_text}")
+                    return
             except Exception:
-                pass
+                continue
 
-    async def _try_search(self, page: Page, query: str) -> bool:
-        """
-        Try to find a search box and search for `query`.
-        Returns True if search was performed.
-        """
-        search_selectors = [
-            "input#autocomplete", # Shopclues
-            "input[type='search']",
-            "input[name='q']",
-            "input[name='search']",
-            "input[placeholder*='search' i]",
-            "input[placeholder*='find' i]",
-            "input[placeholder*='products' i]",
-            "#searchInput", "#search", ".search-input",
-            "input[aria-label*='search' i]",
-            "#twotabsearchtextbox", # Amazon specific
-            "[data-testid='search-input']",
-        ]
-        for sel in search_selectors:
-            try:
-                el = await page.query_selector(sel)
-                if el and await el.is_visible():
-                    logger.info(f"Found search bar via {sel}")
-                    await el.scroll_into_view_if_needed()
-                    await el.click(force=True)
-                    await self._human_pause(0.5, 1.0)
-                    
-                    # Try to clear and type
-                    await el.fill("")
-                    await el.type(query, delay=random.randint(40, 120))
-                    await self._human_pause(0.5, 1.0)
-                    await el.press("Enter")
-                    
-                    # Fallback: Find and click search button if still on same page
-                    await self._human_pause(0.5, 1.0)
-                    button_selectors = [
-                        "button[type='submit']", "button.search-button", ".srch_btn", "#searchBtn",
-                        "i.search-icon", "span.search-icon", "button:has-text('Search')",
-                    ]
-                    for bsel in button_selectors:
-                        try:
-                            btn = await page.query_selector(bsel)
-                            if btn and await btn.is_visible():
-                                await btn.click()
-                                logger.info(f"Clicked search button via {bsel}")
-                                break
-                        except:
-                            pass
-                    
-                    logger.info(f"Search submitted for '{query}'")
-                    return True
-            except Exception as e:
-                logger.debug(f"Search selector {sel} failed: {e}")
-                pass
-        return False
-
-    async def _try_apply_filter(self, page: Page, description: str) -> bool:
-        """
-        Heuristic-based filter application for e-commerce sites.
-        Focuses on price filters as they are most common.
-        """
-        # 1. Parse description for numbers (potential price limit)
-        prices = [int(s) for s in description.split() if s.isdigit()]
-        if not prices:
-            logger.warning(f"No numeric price found in filter description: {description}")
-            return False
-
-        target_price = prices[0]
-        
-        # 2. Try common price filter inputs
-        price_selectors = [
-            "input[name='low-price']", "input[name='high-price']",  # Amazon
-            "input[id*='low' i]", "input[id*='high' i]",
-            "input[id*='min' i]", "input[id*='max' i]",
-            "input[placeholder*='min' i]", "input[placeholder*='max' i]",
-            "input[aria-label*='min' i]", "input[aria-label*='max' i]",
-        ]
-        
-        # We'll try to set the 'high' price if "under" or "less than" is in description
-        is_under = any(w in description.lower() for w in ["under", "less", "max", "up to"])
-        
+    async def _smart_wait(self, page, url: str, timeout: int = 12000):
+        """Wait for site-specific product content to appear."""
+        selectors = self._get_selectors(url)
+        combined = ", ".join(selectors)
         try:
-            if is_under:
-                # Find the 'max' or 'high' price input
-                max_selectors = [s for s in price_selectors if any(k in s.lower() for k in ["high", "max"])]
-                for sel in max_selectors:
-                    el = await page.query_selector(sel)
-                    if el and await el.is_visible():
-                        await el.fill(str(target_price))
-                        await el.press("Enter")
-                        logger.info(f"Applied price filter: under {target_price} via {sel}")
-                        return True
-            else:
-                # Find the 'min' or 'low' price input
-                min_selectors = [s for s in price_selectors if any(k in s.lower() for k in ["low", "min"])]
-                for sel in min_selectors:
-                    el = await page.query_selector(sel)
-                    if el and await el.is_visible():
-                        await el.fill(str(target_price))
-                        await el.press("Enter")
-                        logger.info(f"Applied price filter: above {target_price} via {sel}")
-                        return True
+            await page.wait_for_selector(combined, timeout=timeout)
+            logger.info(f"Smart selector matched content on {url}")
+        except Exception:
+            logger.warning(f"Smart wait timed out on {url} — using raw page content")
+
+    async def load(self, url: str, js_code: str = None) -> dict:
+        """Load a URL with stealth and smart waiting. Returns dict with text/links/url/success."""
+        await self._ensure_browser()
+
+        profile = random.choice(PROFILES)
+        logger.info(f"Profile: {profile['name']} → {url}")
+
+        context = await IntelligentScraper._browser.new_context(
+            user_agent=profile["ua"],
+            viewport=profile["viewport"],
+            is_mobile=profile["is_mobile"],
+            has_touch=profile["is_mobile"],
+            locale="en-IN",
+            timezone_id="Asia/Kolkata",
+        )
+        page = await context.new_page()
+        await Stealth().apply_stealth_async(page)
+
+        try:
+            # Human-like random delay before request
+            await asyncio.sleep(random.uniform(1.0, 2.5))
+
+            await page.goto(url, timeout=60000, wait_until="load")
+            await asyncio.sleep(2)
+
+            # Bypass popups (Accept Cookies etc)
+            await self._bypass_popups(page)
+
+            # Wait for JS-rendered product grids
+            await self._smart_wait(page, url)
+
+            # Realistic Scrolling
+            try:
+                for _ in range(random.randint(3, 5)):
+                    await page.evaluate(f"window.scrollBy(0, {random.randint(500, 900)})")
+                    await asyncio.sleep(1.5)
+            except Exception as scroll_err:
+                pass
+
+            # Execute any JS-based search action
+            if js_code:
+                try:
+                    await page.evaluate(js_code)
+                    await asyncio.sleep(4)
+                    await self._smart_wait(page, page.url)
+                except Exception as je:
+                    logger.warning(f"JS action failed: {je}")
+
+            html = await page.content()
+            tree = HTMLParser(html)
+
+            # Check for bot-detection walls
+            raw_text = tree.text().lower()
+            if any(sig in raw_text for sig in BLOCK_SIGNALS) and len(raw_text) < 5000:
+                logger.warning(f"Bot-detection wall hit on {url}")
+                await context.close()
+                return {"text": "", "html": html, "links": [], "url": page.url, "success": False, "blocked": True}
+
+            # Extract links
+            links = []
+            seen_hrefs = set()
+            for a in tree.css("a"):
+                href = a.attributes.get("href", "")
+                text = a.text(strip=True)
+                if href and text and href not in seen_hrefs:
+                    full_href = urljoin(url, href)
+                    links.append({"text": text, "href": full_href})
+                    seen_hrefs.add(href)
+
+            # Clean and extract text using Markdown converter
+            text = await self._clean_content(html)
+
+            logger.info(f"Loaded {page.url} — {len(text)} chars, {len(links)} links")
+            return {"text": text, "html": html, "links": links, "url": page.url, "success": True}
+
         except Exception as e:
-            logger.error(f"Failed to apply price filter: {e}")
+            logger.error(f"Load failed for {url}: {e}")
+            return {"text": "", "html": "", "links": [], "url": url, "success": False}
+        finally:
+            await context.close()
 
-        # 3. If heuristics fail, we could use LLM here to find the filter buttons
-        # For now, we'll return False if heuristics fail.
-        return False
+    async def close(self):
+        """Gracefully shut down browser (only call on app shutdown)."""
+        try:
+            if IntelligentScraper._browser:
+                await IntelligentScraper._browser.close()
+        except Exception:
+            pass
+        try:
+            if IntelligentScraper._pw:
+                await IntelligentScraper._pw.stop()
+        except Exception:
+            pass
+        IntelligentScraper._browser = None
+        IntelligentScraper._pw = None
 
-    async def _human_pause(self, min_s: float, max_s: float):
-        await asyncio.sleep(random.uniform(min_s, max_s))
+    async def execute_plan(self, base_url: str, plan: dict) -> dict:
+        """Navigate according to the LLM plan and return final page content."""
+        nav = plan.get("navigation", {})
+        nav_type = nav.get("type", "direct")
 
-    async def _auto_scroll(self, page: Page):
-        """Scroll gradually to trigger lazy-loaded content."""
-        await page.evaluate("""
-            async () => {
-                await new Promise(resolve => {
-                    let totalHeight = 0;
-                    const distance = 300;
-                    const timer = setInterval(() => {
-                        window.scrollBy(0, distance);
-                        totalHeight += distance;
-                        if (totalHeight >= document.body.scrollHeight - window.innerHeight) {
-                            clearInterval(timer);
-                            resolve();
-                        }
-                    }, 150);
-                });
-            }
-        """)
-        await self._human_pause(0.5, 1.0)
+        if nav_type == "direct":
+            return await self.load(base_url)
+
+        elif nav_type in ("url", "search"):
+            target_url = nav.get("target_url", "").strip()
+            query = nav.get("search_query", "").strip()
+
+            # If a full URL was provided by the planner, use it directly
+            if target_url and target_url.startswith("http"):
+                logger.info(f"Direct search URL: {target_url}")
+                result = await self.load(target_url)
+                if result["success"] and len(result["text"]) > 500:
+                    return result
+
+            # Build search URL from known site patterns
+            if query:
+                parsed = urlparse(base_url)
+                domain = parsed.netloc.lower()
+                netloc = f"{parsed.scheme}://{parsed.netloc}"
+
+                if "amazon" in domain:
+                    candidates = [f"{netloc}/s?k={quote_plus(query)}"]
+                elif "flipkart" in domain:
+                    candidates = [f"{netloc}/search?q={quote_plus(query)}"]
+                elif "shopclues" in domain:
+                    candidates = [
+                        f"https://m.shopclues.com/search?q={quote_plus(query)}",
+                        f"{netloc}/search?q={quote_plus(query)}",
+                    ]
+                elif "ebay" in domain:
+                    candidates = [f"{netloc}/sch/i.html?_nkw={quote_plus(query)}"]
+                else:
+                    candidates = [
+                        f"{netloc}/search?q={quote_plus(query)}",
+                        f"{netloc}/search?query={quote_plus(query)}",
+                        f"{netloc}/search?keyword={quote_plus(query)}",
+                        f"{netloc}/products?search={quote_plus(query)}",
+                    ]
+
+                for candidate in candidates:
+                    logger.info(f"Trying search URL: {candidate}")
+                    r = await self.load(candidate)
+                    if r["success"] and len(r["text"]) > 500:
+                        return r
+
+            return await self.load(base_url)
+
+        elif nav_type == "link":
+            initial = await self.load(base_url)
+            link_text = nav.get("link_text", "").lower().strip()
+            for link in initial["links"]:
+                if link_text in link["text"].lower():
+                    logger.info(f"Following link: {link['href']}")
+                    return await self.load(link["href"])
+            logger.warning(f"Link '{link_text}' not found, using base page")
+            return initial
+
+        return await self.load(base_url)
