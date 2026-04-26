@@ -98,9 +98,9 @@ export default function App() {
       <header className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div className="space-y-1">
           <h1 className="text-3xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-accent to-purple-400">
-            ScraperBot v4.0 <span className="text-sm font-medium text-gray-500 ml-2">PRO EDITION</span>
+            Universal AI Scraper
           </h1>
-          <p className="text-gray-500 text-sm">Professional AI-Guided Universal Web Scraper</p>
+          <p className="text-gray-500 text-sm">Professional AI-Guided Universal Web Extraction</p>
         </div>
         <div className="flex items-center gap-4 bg-card px-4 py-2 rounded-xl border border-white/5">
           <div className="flex flex-col items-end">
