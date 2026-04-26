@@ -60,15 +60,18 @@ class ScrapeRequest(BaseModel):
 
 from fastapi.staticfiles import StaticFiles
 
-# Mount React static files
+# Serve React build
 app.mount("/assets", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "frontend/dist/assets")), name="assets")
 
 @app.get("/")
 async def root():
-    file_path = os.path.join(os.path.dirname(__file__), "frontend/dist/index.html")
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="React build not found. Run 'npm run build' in frontend folder.")
-    return FileResponse(file_path)
+    # Return index.html from dist
+    return FileResponse(os.path.join(os.path.dirname(__file__), "frontend/dist/index.html"))
+
+# Also handle icons.svg if present in dist
+@app.get("/icons.svg")
+async def icons():
+    return FileResponse(os.path.join(os.path.dirname(__file__), "frontend/dist/icons.svg"))
 
 
 @app.get("/health")
