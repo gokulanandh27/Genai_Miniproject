@@ -1,12 +1,13 @@
 """
-extractor.py — LLM-powered structured data extractor
-Uses Gemini → Groq → SiliconFlow fallback chain for resilience.
+extractor.py - LLM-powered structured data extractor
+Uses Gemini as primary (reliable, high context), Groq as fallback.
 """
 import os
 import json
 import logging
 import re
 import asyncio
+import aiohttp
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
@@ -14,27 +15,30 @@ from langchain_core.messages import SystemMessage, HumanMessage
 
 logger = logging.getLogger(__name__)
 
-EXTRACT_SYSTEM = """You are a master data extraction engine.
+EXTRACT_SYSTEM = """You are a precise data extraction engine.
 
-IDENTIFY INTENT:
-1. SINGULAR FACTS: If the user asks for a specific fact (e.g., "CEO name", "Headquarters"), extract ONLY that single best answer.
-2. REPEATING DATA: If the user asks for a list (e.g., "laptops", "job openings"), extract every matching row.
+TASK: Extract structured data from the webpage content based on the user's request.
 
-Rules:
-- Return ONLY a JSON list of objects: [{"field1": "val", ...}]
-- For REPEATING data, extract AS MANY items as possible up to the limit.
-- For SINGULAR facts, return a list with exactly ONE object containing the fact.
-- Clean all values: remove HTML, extra whitespace, and noisy labels.
-- Do not add explanations. Return pure JSON starting with `[` and ending with `]`.
+RULES:
+1. Return ONLY a JSON array: [{"field1": "value1", ...}, ...]
+2. For LIST requests (products, books, people): extract AS MANY matching items as possible up to the limit.
+3. For SINGULAR facts (CEO, headquarters, founding year): return exactly ONE object.
+4. Each object must only contain the requested fields.
+5. CRITICAL: Never invent data. If a value is missing, use "N/A".
+6. CRITICAL: Extract the item even if some fields (like 'description' or 'rating') are entirely missing from the text.
+7. Do NOT include markdown, explanations, or any text outside the JSON array.
+8. Start with [ and end with ]
 """
 
-# Ordered fallback models
-FALLBACK_MODELS = [
-    ("groq", "llama-3.3-70b-versatile"),
-    ("groq", "llama-3.1-8b-instant"),
-    ("gemini", "gemini-2.5-flash-lite"),
-    ("gemini", "gemini-2.0-flash"),
-    ("gemini", "gemini-1.5-flash"),
+# Verified working models as of April 2026
+GEMINI_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+]
+
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
 ]
 
 
@@ -42,89 +46,79 @@ class LLMExtractor:
     def __init__(self):
         self.google_key = os.getenv("GOOGLE_API_KEY")
         self.groq_key = os.getenv("GROQ_API_KEY")
-        self.sf_key = os.getenv("SILICONFLOW_API_KEY")
 
     def _build_prompt(self, page_text: str, prompt: str, fields: dict, limit: int, filter_desc: str) -> str:
         fields_str = "\n".join(f"- {k}: {v}" for k, v in fields.items())
-        filter_note = f"\nFilter: {filter_desc}" if filter_desc else ""
+        filter_note = f"\nUser Filter Intent: {filter_desc}" if filter_desc else ""
         return (
             f"User Request: {prompt}\n"
-            f"EXTRACT AS MANY ITEMS AS POSSIBLE, up to a maximum of {limit} items.\n"
-            f"Return the data with these fields:\n{fields_str}"
+            f"Extract up to {limit} items. Fields to extract:\n{fields_str}\n"
             f"{filter_note}\n\n"
-            f"Page Content:\n{page_text}\n\n"
+            f"CRITICAL RULES FOR FILTERING:\n"
+            f"- STRICT RULE: Filter out items that are completely irrelevant (e.g. if the user wants 'mobile phones', do NOT extract phone cases, stands, chargers, or wires).\n"
+            f"- PRICE RULE: Try to respect price limits (e.g. 'under 20000').\n"
+            f"- FALLBACK RULE: If you cannot find {limit} items under the price limit on this page, YOU MUST RELAX THE PRICE FILTER and extract other relevant items (e.g. phones priced slightly higher) until you reach the {limit} item limit. It is better to return a phone slightly over budget than to return an empty list.\n\n"
+            f"--- PAGE CONTENT ---\n{page_text}\n--- END ---\n\n"
             f"Return ONLY a JSON array."
         )
 
     async def extract(self, page_text: str, prompt: str, fields: dict, limit: int = 10, filter_desc: str = "") -> list:
-        if not page_text.strip():
+        if not page_text or not page_text.strip():
             return []
 
-        # ── 1. Try Groq (Fastest/Reliable) ────────────
-        groq_text = page_text[:40000] # Safe limit for Llama-3 70b
-        messages = [
-            SystemMessage(content=EXTRACT_SYSTEM),
-            HumanMessage(content=self._build_prompt(groq_text, prompt, fields, limit, filter_desc))
-        ]
-        for model in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
-            try:
-                if not self.groq_key: break
-                llm = ChatOpenAI(
-                    model=model,
-                    openai_api_key=self.groq_key,
-                    openai_api_base="https://api.groq.com/openai/v1",
-                    temperature=0,
-                    max_tokens=4096,
-                )
-                resp = await llm.ainvoke(messages)
-                parsed = self._parse(resp.content)
-                if parsed is not None:
-                    logger.info(f"Extracted {len(parsed)} items via groq/{model}")
-                    return parsed[:limit]
-            except Exception as e:
-                logger.warning(f"Extractor fallback groq/{model} failed: {e}")
+        # ── Fast path: Try Gemini first (reliable, high context, no daily quota)
+        gemini_text = page_text[:80000]
+        gemini_prompt = f"{EXTRACT_SYSTEM}\n\n{self._build_prompt(gemini_text, prompt, fields, limit, filter_desc)}"
 
-        # ── 2. Try Gemini (High Context) ──────────────
-        gemini_text = page_text[:150000]
-        messages = [
-            SystemMessage(content=EXTRACT_SYSTEM),
-            HumanMessage(content=self._build_prompt(gemini_text, prompt, fields, limit, filter_desc))
-        ]
-        for model in ["gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-1.5-flash"]:
-            try:
-                if not self.google_key: break
-                llm = ChatGoogleGenerativeAI(
-                    model=model, 
-                    google_api_key=self.google_key, 
-                    temperature=0,
-                    max_retries=0
-                )
-                resp = await llm.ainvoke(messages)
-                parsed = self._parse(resp.content)
-                if parsed is not None:
-                    logger.info(f"Extracted {len(parsed)} items via {model}")
-                    return parsed[:limit]
-            except Exception as e:
-                logger.warning(f"Extractor fallback {model} failed: {e}")
+        if self.google_key:
+            for model in GEMINI_MODELS:
+                try:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.google_key}"
+                    payload = {
+                        "contents": [{"parts": [{"text": gemini_prompt}]}],
+                        "generationConfig": {"temperature": 0.0}
+                    }
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(url, json=payload) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                content = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                                parsed = self._parse(content)
+                                if parsed is not None and len(parsed) > 0:
+                                    logger.info(f"Extracted {len(parsed)} items via pure Gemini API/{model}")
+                                    return parsed[:limit]
+                                else:
+                                    logger.warning(f"Gemini API/{model} returned empty list")
+                            else:
+                                logger.warning(f"Gemini API/{model} failed with HTTP {resp.status}: {await resp.text()}")
+                except Exception as e:
+                    logger.warning(f"Gemini API/{model} failed: {e}")
 
-        # ── 3. Try SiliconFlow ──────────────────────────
-        for model in ["deepseek-ai/DeepSeek-V3"]:
-            try:
-                if not self.sf_key: break
-                llm = ChatOpenAI(
-                    model=model,
-                    openai_api_key=self.sf_key,
-                    openai_api_base="https://api.siliconflow.cn/v1",
-                    temperature=0,
-                    max_tokens=4096,
-                )
-                resp = await llm.ainvoke(messages)
-                parsed = self._parse(resp.content)
-                if parsed is not None:
-                    logger.info(f"Extracted {len(parsed)} items via siliconflow/{model}")
-                    return parsed[:limit]
-            except Exception as e:
-                logger.warning(f"Extractor fallback siliconflow/{model} failed: {e}")
+        # ── Fallback: Try Groq (fast, but strict daily limits on free tier) ───────
+        groq_text = page_text[:2500] # Safe limit to avoid 413 Payload Too Large (6000 TPM limit)
+        groq_prompt = self._build_prompt(groq_text, prompt, fields, limit, filter_desc)
+        groq_messages = [
+            SystemMessage(content=EXTRACT_SYSTEM),
+            HumanMessage(content=groq_prompt)
+        ]
+
+        if self.groq_key:
+            for model in GROQ_MODELS:
+                try:
+                    llm = ChatOpenAI(
+                        model=model,
+                        openai_api_key=self.groq_key,
+                        openai_api_base="https://api.groq.com/openai/v1",
+                        temperature=0,
+                        max_tokens=4096,
+                    )
+                    resp = await llm.ainvoke(groq_messages)
+                    parsed = self._parse(resp.content)
+                    if parsed is not None and len(parsed) > 0:
+                        logger.info(f"Extracted {len(parsed)} items via Groq/{model}")
+                        return parsed[:limit]
+                except Exception as e:
+                    logger.warning(f"Groq/{model} failed: {e}")
 
         logger.error("All LLM providers exhausted")
         return []
@@ -136,8 +130,8 @@ class LLMExtractor:
         # Remove markdown fences
         raw = re.sub(r"^```(?:json)?\n?", "", raw, flags=re.IGNORECASE)
         raw = re.sub(r"\n?```$", "", raw, flags=re.IGNORECASE)
-        
-        # Helper to find array inside dict
+        raw = raw.strip()
+
         def extract_array(data):
             if isinstance(data, list):
                 return data
@@ -151,7 +145,7 @@ class LLMExtractor:
             data = json.loads(raw)
             return extract_array(data)
         except Exception:
-            # Fallback regex to find array
+            # Fallback: find JSON array anywhere in the text
             match = re.search(r"\[[\s\S]*\]", raw)
             if match:
                 try:
@@ -159,5 +153,5 @@ class LLMExtractor:
                     return extract_array(data)
                 except Exception:
                     pass
-        logger.warning(f"Failed to parse JSON from LLM response. Snippet: {raw[:100]}")
+        logger.warning(f"Failed to parse JSON. Snippet: {raw[:200]}")
         return []

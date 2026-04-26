@@ -65,11 +65,11 @@ Important rules:
 """
 
 FALLBACK_MODELS = [
-    ("groq", "llama-3.3-70b-versatile"),
-    ("groq", "llama-3.1-8b-instant"),
     ("gemini", "gemini-2.5-flash-lite"),
     ("gemini", "gemini-2.0-flash"),
-    ("gemini", "gemini-1.5-flash"),
+    ("gemini", "gemini-2.5-flash"),
+    ("groq", "llama-3.3-70b-versatile"),
+    ("groq", "llama-3.1-8b-instant"),
 ]
 
 class LLMPlanner:
